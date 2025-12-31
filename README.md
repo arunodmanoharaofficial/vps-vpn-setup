@@ -1,5 +1,17 @@
 # 🚀 VPS VPN Setup
 
+<p align="center">
+  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=22&pause=1000&center=true&vCenter=true&width=780&lines=VPS+VPN+Setup+%E2%9A%A1+BBR+%2B+Safe+Sysctl+Tuning;3x-ui%2FXray+Ready+%E2%80%94+50%E2%80%93100+Clients;Optional+DNS+Hardening+%F0%9F%9B%A1%EF%B8%8F+Quick+Verify+Included" alt="Typing SVG" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/OS-Debian%2013%20%7C%20Ubuntu-blue?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Shell-bash-black?style=for-the-badge" />
+  <img src="https://img.shields.io/github/last-commit/arunodmanoharaofficial/vps-vpn-setup?style=for-the-badge" />
+  <img src="https://img.shields.io/github/stars/arunodmanoharaofficial/vps-vpn-setup?style=for-the-badge" />
+</p>
+
+
 This repository contains an installer script and tuning recommendations for setting up a Debian 13 (or Ubuntu) VPS to run a VPN server for up to 50–100 clients using 3x‑ui/Xray (VLESS/Trojan/VMess) while maintaining stability and good performance.
 
 ## 📦 Contents
