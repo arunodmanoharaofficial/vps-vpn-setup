@@ -1,306 +1,306 @@
-```bash
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# ============================================================
-# VPS VPN Setup Installer (Debian/Ubuntu)
-# - Enables BBR (or tries BBR2 and falls back safely)
-# - Applies safe sysctl tuning for VPN traffic (50–100 clients)
+# VPS VPN Setup Installer
+# - Enables BBR (or tries BBR2, falls back to BBR)
+# - Applies safe sysctl tuning for VPN traffic
 # - Optionally configures DNS via systemd-resolved
-# - Installs basic troubleshooting tools
-# - Creates backups before changing anything
+# - Optionally installs basic network tools (dig/ping/curl)
 #
-# Matches README commands:
-#   --bbr --bbr2 --vpn-tuning --dns cloudflare|quad9|google --no-dns
-# ============================================================
+# Usage examples:
+#   bash install.sh --bbr --vpn-tuning --dns cloudflare
+#   bash install.sh --bbr2 --vpn-tuning --dns cloudflare
+#   bash install.sh --bbr --vpn-tuning --no-dns
 
-log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
-die()  { echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
+SCRIPT_NAME="$(basename "$0")"
+BACKUP_DIR=""
+
+log()  { echo -e "✅ $*"; }
+warn() { echo -e "⚠️  $*" >&2; }
+die()  { echo -e "❌ $*" >&2; exit 1; }
 
 usage() {
-  cat <<'EOF'
-Usage:
-  sudo bash install.sh [options]
+  cat <<EOF
+🚀 VPS VPN Setup - install.sh
 
 Options:
-  --bbr            Enable BBR (recommended)
-  --bbr2           Try BBR2; falls back to BBR if unsupported
-  --vpn-tuning     Apply safe VPN tuning sysctls
-  --dns PROVIDER   Configure DNS via systemd-resolved:
-                   cloudflare | quad9 | google
-  --no-dns         Do not change DNS
-  --dry-run        Print actions without writing files
-  -h, --help       Show help
+  --bbr                 Enable BBR + fq
+  --bbr2                Try BBR2 (fallback to BBR if not supported)
+  --vpn-tuning           Apply safe sysctl tuning for VPN/NAT traffic
+  --dns <provider|ips>   Configure DNS via systemd-resolved
+                         Providers: cloudflare | quad9 | google
+                         Or custom list: "1.1.1.1,1.0.0.1"
+  --no-dns               Do not change DNS
+  --no-tools             Skip installing curl/dig/ping tools
+  -h, --help             Show this help
 
 Examples:
-  sudo bash install.sh --bbr --vpn-tuning --dns cloudflare
+  curl -fsSL https://raw.githubusercontent.com/arunodmanoharaofficial/vps-vpn-setup/main/install.sh | sudo bash -s -- --bbr --vpn-tuning --dns cloudflare
   sudo bash install.sh --bbr2 --vpn-tuning --dns cloudflare
   sudo bash install.sh --bbr --vpn-tuning --no-dns
 EOF
 }
 
-# -------------------------
-# Defaults
-# -------------------------
-ENABLE_BBR=false
-TRY_BBR2=false
-APPLY_VPN_TUNING=false
-DNS_PROVIDER=""
-SKIP_DNS=false
-DRY_RUN=false
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Please run as root (use: sudo bash $SCRIPT_NAME ...)"
+  fi
+}
 
-# If user runs with no flags, do a safe default:
-# BBR + VPN tuning + no DNS changes (avoid surprises)
-DEFAULT_IF_EMPTY=true
+ensure_backup_dir() {
+  if [[ -z "$BACKUP_DIR" ]]; then
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_DIR="/root/vps-tuning-backup-${ts}"
+    mkdir -p "$BACKUP_DIR"
+    log "Backup folder: $BACKUP_DIR"
+  fi
+}
 
-# -------------------------
-# Parse args
-# -------------------------
-if [[ $# -gt 0 ]]; then
-  DEFAULT_IF_EMPTY=false
-fi
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --bbr) ENABLE_BBR=true; shift ;;
-    --bbr2) TRY_BBR2=true; shift ;;
-    --vpn-tuning) APPLY_VPN_TUNING=true; shift ;;
-    --dns) DNS_PROVIDER="${2:-}"; [[ -n "$DNS_PROVIDER" ]] || die "--dns requires a value"; shift 2 ;;
-    --no-dns) SKIP_DNS=true; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "Unknown option: $1" ;;
-  esac
-done
-
-if $DEFAULT_IF_EMPTY; then
-  ENABLE_BBR=true
-  APPLY_VPN_TUNING=true
-  SKIP_DNS=true
-fi
-
-run() {
-  if $DRY_RUN; then
-    echo "[dry-run] $*"
-  else
-    eval "$@"
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    ensure_backup_dir
+    cp -a "$f" "$BACKUP_DIR/"
+    log "Backed up: $f"
   fi
 }
 
 write_file() {
   local path="$1"
   local content="$2"
-  run "mkdir -p '$(dirname "$path")'"
-  if $DRY_RUN; then
-    echo "[dry-run] write -> $path"
-    echo "$content"
-  else
-    printf "%s\n" "$content" > "$path"
-  fi
+  mkdir -p "$(dirname "$path")"
+  backup_file "$path"
+  printf "%s\n" "$content" > "$path"
+  chmod 0644 "$path"
+  log "Wrote: $path"
 }
 
-need_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (use sudo)."
-}
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-detect_os() {
-  if [[ -r /etc/os-release ]]; then
-    . /etc/os-release
-  else
-    die "Cannot detect OS (/etc/os-release missing)."
-  fi
-  case "${ID:-}" in
-    debian|ubuntu) : ;;
-    *) warn "This script is intended for Debian/Ubuntu (detected: ${ID:-unknown}). Continuing..." ;;
+# -------------------------
+# Parse args
+# -------------------------
+DO_BBR=false
+DO_BBR2=false
+DO_VPN_TUNING=false
+DNS_MODE=""
+NO_DNS=false
+INSTALL_TOOLS=true
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bbr) DO_BBR=true; shift ;;
+    --bbr2) DO_BBR2=true; shift ;;
+    --vpn-tuning) DO_VPN_TUNING=true; shift ;;
+    --dns)
+      [[ $# -ge 2 ]] || die "--dns needs a value (cloudflare|quad9|google|ip,ip)"
+      DNS_MODE="$2"
+      shift 2
+      ;;
+    --no-dns) NO_DNS=true; shift ;;
+    --no-tools) INSTALL_TOOLS=false; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1 (use --help)";;
   esac
-}
+done
 
-backup_files() {
-  local ts backup_dir
-  ts="$(date +%Y%m%d-%H%M%S)"
-  backup_dir="/root/vps-vpn-setup-backup-$ts"
-  run "mkdir -p '$backup_dir'"
+require_root
 
-  for f in \
-    /etc/sysctl.d/99-bbr.conf \
-    /etc/sysctl.d/99-vpn-tuning.conf \
-    /etc/modules-load.d/bbr.conf \
-    /etc/systemd/resolved.conf \
-    /etc/systemd/resolved.conf.d/dns.conf \
-    /etc/systemd/resolved.conf.d/99-dns.conf \
-    /etc/resolv.conf
-  do
-    if [[ -e "$f" ]]; then
-      run "cp -a '$f' '$backup_dir/'"
-    fi
-  done
-
-  log "Backups saved to: $backup_dir"
-}
-
-install_tools() {
-  log "Installing basic troubleshooting tools..."
-  run "apt-get update -y"
-  run "apt-get install -y --no-install-recommends curl ca-certificates dnsutils iputils-ping iproute2 procps jq"
-}
-
-apply_sysctl() {
-  log "Applying sysctl settings..."
-  run "sysctl --system >/dev/null || true"
-}
-
-apply_bbr() {
-  log "Enabling BBR (v1) + fq..."
-
-  # Persist module load
-  write_file "/etc/modules-load.d/bbr.conf" "tcp_bbr"
-  run "modprobe tcp_bbr || true"
-
-  write_file "/etc/sysctl.d/99-bbr.conf" $'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n'
-  apply_sysctl
-}
-
-apply_bbr2_or_fallback() {
-  log "Trying to enable BBR2 (fallback to BBR if unsupported)..."
-
-  # Try loading BBR2 module (many kernels won't have it)
-  if run "modprobe tcp_bbr2"; then
-    write_file "/etc/modules-load.d/bbr.conf" "tcp_bbr2"
-    write_file "/etc/sysctl.d/99-bbr.conf" $'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr2\n'
-    apply_sysctl
-    log "BBR2 enabled ✅"
+# -------------------------
+# Install basic tools (optional)
+# -------------------------
+if $INSTALL_TOOLS; then
+  if has_cmd apt-get; then
+    log "Installing basic tools (curl, dig, ping)..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null
+    apt-get install -y ca-certificates curl iputils-ping bind9-dnsutils >/dev/null || warn "Tool install had warnings; continuing."
   else
-    warn "BBR2 not available on this kernel. Falling back to BBR v1 ✅"
-    apply_bbr
+    warn "apt-get not found; skipping tool install."
   fi
+else
+  log "Skipping tools install (--no-tools)."
+fi
+
+# -------------------------
+# BBR / BBR2
+# -------------------------
+enable_bbr_like() {
+  local want="$1"  # bbr or bbr2
+  local module=""
+  local algo="$want"
+
+  if [[ "$want" == "bbr2" ]]; then
+    module="tcp_bbr2"
+  else
+    module="tcp_bbr"
+  fi
+
+  # Try to load module (may fail if not built as module)
+  if modprobe "$module" >/dev/null 2>&1; then
+    log "Loaded module: $module"
+  else
+    warn "Could not load $module (may be unavailable or built-in)."
+  fi
+
+  # Check available congestion controls
+  local avail=""
+  if sysctl -n net.ipv4.tcp_available_congestion_control >/dev/null 2>&1; then
+    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control || true)"
+  fi
+
+  # If BBR2 requested but not available, fallback to BBR
+  if [[ "$want" == "bbr2" ]]; then
+    if [[ " $avail " != *" bbr2 "* ]]; then
+      warn "BBR2 not available on this kernel. Falling back to BBR."
+      algo="bbr"
+      modprobe tcp_bbr >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Persist module load (best-effort)
+  write_file "/etc/modules-load.d/bbr.conf" "tcp_bbr"
+
+  # Apply sysctl for fq + chosen algo
+  write_file "/etc/sysctl.d/99-bbr.conf" \
+"[BBR]
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=${algo}
+"
+
+  log "Applying sysctl..."
+  sysctl --system >/dev/null 2>&1 || warn "sysctl --system returned warnings."
+
+  # Show status
+  log "BBR status:"
+  sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+  sysctl net.core.default_qdisc 2>/dev/null || true
 }
 
-apply_vpn_tuning() {
+if $DO_BBR2; then
+  log "Enabling BBR2 (fallback to BBR if unsupported)..."
+  enable_bbr_like "bbr2"
+elif $DO_BBR; then
+  log "Enabling BBR..."
+  enable_bbr_like "bbr"
+fi
+
+# -------------------------
+# VPN sysctl tuning
+# -------------------------
+if $DO_VPN_TUNING; then
   log "Applying VPN sysctl tuning..."
 
-  # Matches your README table (balanced, safe)
-  write_file "/etc/sysctl.d/99-vpn-tuning.conf" $'\
-net.core.somaxconn=65535\n\
-net.core.netdev_max_backlog=250000\n\
-net.ipv4.tcp_max_syn_backlog=8192\n\
-\n\
-net.ipv4.tcp_fastopen=3\n\
-net.ipv4.tcp_mtu_probing=1\n\
-\n\
-net.ipv4.tcp_fin_timeout=15\n\
-net.ipv4.tcp_keepalive_time=600\n\
-net.ipv4.tcp_keepalive_intvl=60\n\
-net.ipv4.tcp_keepalive_probes=5\n\
-\n\
-net.netfilter.nf_conntrack_max=262144\n\
-\n\
-net.core.rmem_max=16777216\n\
-net.core.wmem_max=16777216\n\
-net.ipv4.tcp_rmem=4096 87380 16777216\n\
-net.ipv4.tcp_wmem=4096 65536 16777216\n'
+  # Safe, practical defaults for 50–100 clients on typical VPS
+  # (Not ultra-aggressive; avoids risky kernel changes)
+  write_file "/etc/sysctl.d/99-vpn-tuning.conf" \
+"[VPN Tuning]
+# Faster handshakes / better burst handling
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=250000
+net.ipv4.tcp_max_syn_backlog=8192
 
-  apply_sysctl
-}
+# TCP behavior improvements
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fin_timeout=15
 
-dns_block_for() {
-  case "$1" in
+# Keepalives to reduce stuck sessions
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=60
+net.ipv4.tcp_keepalive_probes=5
+
+# Conntrack for NAT-heavy usage (many VPN clients)
+net.netfilter.nf_conntrack_max=262144
+
+# Socket buffers (moderate increase)
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+"
+
+  log "Applying sysctl..."
+  sysctl --system >/dev/null 2>&1 || warn "sysctl --system returned warnings."
+  log "VPN tuning applied."
+fi
+
+# -------------------------
+# DNS (systemd-resolved)
+# -------------------------
+configure_dns() {
+  local mode="$1"
+  local dns=""
+  local fallback=""
+
+  case "$mode" in
     cloudflare)
-      echo -e "DNS=1.1.1.1 1.0.0.1\nFallbackDNS=9.9.9.9 149.112.112.112"
+      dns="1.1.1.1 1.0.0.1"
+      fallback="9.9.9.9 149.112.112.112"
       ;;
     quad9)
-      echo -e "DNS=9.9.9.9 149.112.112.112\nFallbackDNS=1.1.1.1 1.0.0.1"
+      dns="9.9.9.9 149.112.112.112"
+      fallback="1.1.1.1 1.0.0.1"
       ;;
     google)
-      echo -e "DNS=8.8.8.8 8.8.4.4\nFallbackDNS=1.1.1.1 1.0.0.1"
+      dns="8.8.8.8 8.8.4.4"
+      fallback="1.1.1.1 1.0.0.1"
       ;;
     *)
-      die "Unknown DNS provider: $1 (use cloudflare|quad9|google)"
+      # Custom list: allow commas/spaces
+      dns="${mode//,/ }"
+      fallback="9.9.9.9 149.112.112.112"
       ;;
   esac
-}
 
-apply_dns() {
-  [[ -n "$DNS_PROVIDER" ]] || die "--dns requires a provider (cloudflare|quad9|google)"
-  log "Configuring DNS via systemd-resolved ($DNS_PROVIDER)..."
-
-  if ! command -v resolvectl >/dev/null 2>&1; then
-    warn "resolvectl not found; installing systemd-resolved..."
-    run "apt-get update -y"
-    run "apt-get install -y systemd-resolved"
+  if ! has_cmd systemctl || ! systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved'; then
+    warn "systemd-resolved not detected. Skipping DNS config."
+    return 0
   fi
 
-  run "mkdir -p /etc/systemd/resolved.conf.d"
+  mkdir -p /etc/systemd/resolved.conf.d
 
-  local dns_lines
-  dns_lines="$(dns_block_for "$DNS_PROVIDER")"
+  write_file "/etc/systemd/resolved.conf.d/dns.conf" \
+"[Resolve]
+DNS=${dns}
+FallbackDNS=${fallback}
+DNSSEC=no
+"
 
-  write_file "/etc/systemd/resolved.conf.d/dns.conf" $"[Resolve]\n${dns_lines}\nDNSSEC=no\n"
+  log "Restarting systemd-resolved..."
+  systemctl restart systemd-resolved || warn "Failed to restart systemd-resolved."
 
-  run "systemctl enable systemd-resolved >/dev/null 2>&1 || true"
-  run "systemctl restart systemd-resolved || true"
-  run "resolvectl flush-caches >/dev/null 2>&1 || true"
-
-  # Some providers manage /etc/resolv.conf; warn if it isn't a symlink
-  if [[ -e /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
-    warn "/etc/resolv.conf is not a symlink. Your provider/network may still inject DNS on interfaces."
-    warn "This is usually OK; systemd-resolved will still use the configured DNS as a global resolver."
+  if has_cmd resolvectl; then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+    log "DNS status (resolvectl):"
+    resolvectl status | sed -n '1,25p' || true
+  else
+    warn "resolvectl not found; can't display DNS status."
   fi
 }
 
-verify() {
-  log "Verification:"
-  echo "Kernel: $(uname -r)"
-  echo "Available CC: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-  echo "CC active:    $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  echo "qdisc:        $(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-  echo "fastopen:     $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || true)"
-  echo "mtu_probing:  $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || true)"
-  echo "backlog:      $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
-  echo "somaxconn:    $(sysctl -n net.core.somaxconn 2>/dev/null || true)"
-  echo "conntrack:    $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+if $NO_DNS; then
+  log "DNS changes skipped (--no-dns)."
+elif [[ -n "$DNS_MODE" ]]; then
+  log "Configuring DNS: $DNS_MODE"
+  configure_dns "$DNS_MODE"
+fi
 
-  if command -v lsmod >/dev/null 2>&1; then
-    echo "tcp_bbr loaded:  $(lsmod | grep -q '^tcp_bbr' && echo yes || echo no)"
-    echo "tcp_bbr2 loaded: $(lsmod | grep -q '^tcp_bbr2' && echo yes || echo no)"
-  fi
-
-  if command -v resolvectl >/dev/null 2>&1; then
-    echo
-    log "DNS (resolvectl status):"
-    resolvectl status | sed -n '1,40p' || true
-  fi
-}
-
-main() {
-  need_root
-  detect_os
-  backup_files
-  install_tools
-
-  if $TRY_BBR2; then
-    apply_bbr2_or_fallback
-  elif $ENABLE_BBR; then
-    apply_bbr
-  fi
-
-  if $APPLY_VPN_TUNING; then
-    apply_vpn_tuning
-  fi
-
-  if $SKIP_DNS; then
-    log "Skipping DNS changes (--no-dns)."
-  elif [[ -n "$DNS_PROVIDER" ]]; then
-    apply_dns
-  fi
-
-  verify
-
-  echo
-  log "Done ✅"
-  warn "Firewall was NOT changed (safe)."
-  warn "Reboot is optional. Settings persist via /etc/sysctl.d and /etc/modules-load.d."
-}
-
-main
-```
+# -------------------------
+# Final tips
+# -------------------------
+echo
+log "Done 🎉"
+echo "Quick verify commands:"
+echo "  sysctl net.ipv4.tcp_congestion_control"
+echo "  sysctl net.core.default_qdisc"
+echo "  sysctl net.ipv4.tcp_available_congestion_control"
+echo "  lsmod | egrep 'tcp_bbr|tcp_bbr2' || true"
+echo "  resolvectl status | sed -n '1,25p' || true"
+echo
